@@ -23,21 +23,26 @@ def record(db: Connection, body: Evidence) -> dict:
             raise conflict("evidence_changed", "证明编号已对应另一份内容")
         return {**payload, "replayed": True, "digest": value}
     supply = db.execute(
-        "SELECT payload FROM supplies WHERE item_id=? AND source=? AND source_revision=?",
-        (body.supply_id, body.source, body.source_revision),
+        """SELECT payload FROM supplies
+           WHERE item_id=? AND source=? AND source_revision=? AND template=?""",
+        (body.supply_id, body.source, body.source_revision, body.template),
     ).fetchone()
     if supply is None:
         raise missing("supply", body.supply_id)
     if json.loads(supply["payload"])["category"] != body.category:
         raise invalid("evidence_category", "证明类别与供给类别不一致")
-    db.execute("INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-               (body.evidence_id, body.supply_id, body.category, body.issuer, body.issued_at.isoformat(),
-                body.expires_at.isoformat(), body.source, body.source_revision, body.document_ref, body.status, value))
+    db.execute("INSERT INTO evidence VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+               (body.evidence_id, body.supply_id, body.category, body.issuer,
+                body.issued_at.isoformat(), body.expires_at.isoformat(), body.source,
+                body.source_revision, body.document_ref, body.status, value, body.template))
     return {**payload, "replayed": False, "digest": value}
 
 
-def active_for(db: Connection, supply_id: str, category: str, at: datetime, *, source: str | None = None, revision: int | None = None) -> list[Evidence]:
-    query = "SELECT * FROM evidence WHERE supply_id=? AND category=? AND status='verified' AND issued_at<=? AND expires_at>?"
+def active_for(db: Connection, supply_id: str, category: str, at: datetime, *,
+               source: str | None = None, revision: int | None = None,
+               template: str | None = None) -> list[Evidence]:
+    query = ("SELECT * FROM evidence WHERE supply_id=? AND category=? AND status='verified' "
+             "AND issued_at<=? AND expires_at>?")
     args: list = [supply_id, category, at.isoformat(), at.isoformat()]
     if revision is not None:
         query += " AND source_revision=?"
@@ -45,12 +50,16 @@ def active_for(db: Connection, supply_id: str, category: str, at: datetime, *, s
     if source is not None:
         query += " AND source=?"
         args.append(source)
+    if template is not None:
+        query += " AND template=?"
+        args.append(template)
     rows = db.execute(query + " ORDER BY expires_at DESC,evidence_id", args).fetchall()
     return [Evidence.model_validate({key: row[key] for key in Evidence.model_fields}) for row in rows]
 
 
 def list_evidence(db: Connection, supply_id: str | None = None) -> list[dict]:
-    query = "SELECT evidence_id,supply_id,category,issuer,issued_at,expires_at,source,source_revision,document_ref,status,digest FROM evidence"
+    query = ("SELECT evidence_id,supply_id,category,issuer,issued_at,expires_at,source,"
+             "source_revision,document_ref,status,digest,template FROM evidence")
     args = []
     if supply_id:
         query += " WHERE supply_id=?"

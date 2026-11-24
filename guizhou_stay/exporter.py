@@ -13,18 +13,22 @@ def frozen_csv(document: dict) -> str:
     output = io.StringIO(newline="")
     writer = csv.writer(output, lineterminator="\r\n")
     writer.writerow(("package_id", "edition", "source_revision", "category", "identity_id",
-                     "item_id", "state", "source", "session", "page", "page_digest", "proof"))
+                     "item_id", "state", "source", "session", "page", "page_digest",
+                     "template", "window_code", "proof"))
     for category, result in document["items"].items():
         for finding in result["findings"]:
             context = (document["package_id"], document["revision"], document["source_revision"],
                        category, finding["identity_id"], finding["item_id"], finding["state"])
             if not finding["witnesses"]:
-                writer.writerow((*context, "", "", "", "", ""))
+                writer.writerow((*context, "", "", "", "", "", "", ""))
             for witness in finding["witnesses"]:
+                interpretation = witness.get("interpretation") or {}
                 proofs = "|".join(sorted(value["evidence_id"] for value in witness["proofs"]))
                 for page in witness["captures"]:
                     writer.writerow((*context, witness["item"]["source"], page["session_id"],
-                                     page["page_no"], page["page_digest"], proofs))
+                                     page["page_no"], page["page_digest"],
+                                     interpretation.get("template") or witness["item"].get("template") or "",
+                                     interpretation.get("window_code") or "", proofs))
     return output.getvalue()
 
 

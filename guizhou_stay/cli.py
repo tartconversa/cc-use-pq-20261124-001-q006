@@ -7,7 +7,7 @@ import sys
 
 from pydantic import ValidationError
 
-from guizhou_stay import bundles, catalog, collector, crawl, verification
+from guizhou_stay import bundles, catalog, collector, crawl, rebase, recovery, verification
 from guizhou_stay.contracts import Page, SessionOpen
 from guizhou_stay.errors import DomainError, conflict
 from guizhou_stay.portal import FolderReader
@@ -47,6 +47,33 @@ def report(store, args):
 def audit(store, args):
     with store.transaction() as db:
         return verification.review(db, args.session)
+
+
+def inventory(store, args):
+    with store.transaction() as db:
+        return recovery.page_inventory(db, args.session)
+
+
+def recover(store, args):
+    with store.transaction() as db:
+        return recovery.plan(db, args.session, successor=args.successor)
+
+
+def reassemble(store, args):
+    with store.transaction() as db:
+        return recovery.assemble(db, args.session, successor=args.successor)
+
+
+def rebase_session(store, args):
+    with store.transaction(write=True) as db:
+        return rebase.record(db, rebase.RebaseRequest(
+            rebase_id=args.rebase_id, session_id=args.session,
+            target_template=args.template))
+
+
+def rebase_history(store, args):
+    with store.transaction() as db:
+        return {"items": rebase.history(db, args.session)}
 
 
 def export(store, args):
@@ -90,10 +117,30 @@ def parser():
     crawl_cmd.add_argument("--limit", type=int, default=10)
     crawl_cmd.set_defaults(handle=collect)
 
-    for name, handler in (("report", report), ("audit", audit)):
+    for name, handler in (("report", report), ("audit", audit), ("inventory", inventory)):
         command = commands.add_parser(name)
         command.add_argument("session")
         command.set_defaults(handle=handler)
+
+    recover_cmd = commands.add_parser("recover", help="模板切换后的恢复演练")
+    recover_cmd.add_argument("session")
+    recover_cmd.add_argument("--successor", help="同一范围下用新模板重采的完整会话")
+    recover_cmd.set_defaults(handle=recover)
+
+    assemble_cmd = commands.add_parser("reassemble", help="按共同业务解释恢复出件")
+    assemble_cmd.add_argument("session")
+    assemble_cmd.add_argument("--successor")
+    assemble_cmd.set_defaults(handle=reassemble)
+
+    rebase_cmd = commands.add_parser("rebase", help="按新口径重读历史形成新依据")
+    rebase_cmd.add_argument("rebase_id")
+    rebase_cmd.add_argument("session")
+    rebase_cmd.add_argument("--template", required=True)
+    rebase_cmd.set_defaults(handle=rebase_session)
+
+    rebase_list = commands.add_parser("rebases", help="列出会话的重读依据")
+    rebase_list.add_argument("session")
+    rebase_list.set_defaults(handle=rebase_history)
 
     archive = commands.add_parser("bundle", help="导出封存供给包")
     archive.add_argument("package")

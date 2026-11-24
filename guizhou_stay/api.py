@@ -9,7 +9,9 @@ from pathlib import Path
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, Response
 
-from guizhou_stay import bundles, catalog, collector, coverage, crawl, exporter, filters, handoff, plans, provenance, reconcile, verification
+from guizhou_stay import (bundles, catalog, collector, coverage, crawl, exporter,
+                          filters, handoff, plans, provenance, rebase, reconcile,
+                          recovery, verification)
 from guizhou_stay.contracts import CoveragePolicy, Evidence, Page, PublishRequest, SessionOpen
 from guizhou_stay.digest import digest
 from guizhou_stay.errors import DomainError, conflict, missing
@@ -145,6 +147,36 @@ def create_app(database: str | Path) -> FastAPI:
     def review_session(session_id: str):
         with store.transaction() as db:
             return verification.review(db, session_id)
+
+    @app.get("/sessions/{session_id}/inventory")
+    def session_inventory(session_id: str):
+        with store.transaction() as db:
+            return recovery.page_inventory(db, session_id)
+
+    @app.get("/sessions/{session_id}/recovery")
+    def session_recovery(session_id: str, successor: str | None = Query(default=None)):
+        with store.transaction() as db:
+            return recovery.plan(db, session_id, successor=successor)
+
+    @app.post("/sessions/{session_id}/recovery/assemble")
+    def session_recovery_assemble(session_id: str, successor: str | None = Query(default=None)):
+        with store.transaction() as db:
+            return recovery.assemble(db, session_id, successor=successor)
+
+    @app.post("/rebases")
+    def create_rebase(body: rebase.RebaseRequest):
+        with store.transaction(write=True) as db:
+            return rebase.record(db, body)
+
+    @app.get("/rebases/{rebase_id}")
+    def read_rebase(rebase_id: str):
+        with store.transaction() as db:
+            return rebase.read(db, rebase_id)
+
+    @app.get("/sessions/{session_id}/rebases")
+    def list_rebases(session_id: str):
+        with store.transaction() as db:
+            return {"items": rebase.history(db, session_id)}
 
     @app.get("/catalog/search")
     def catalog_search(region: str | None = None, category: str | None = None,

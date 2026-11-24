@@ -21,8 +21,12 @@ class Difference:
         previous = self.before.winner if self.before else None
         current = self.after.winner if self.after else None
         changes = {}
+        not_comparable = sorted(set(self.before.not_comparable() if self.before else [])
+                                | set(self.after.not_comparable() if self.after else []))
         if previous is not None and current is not None:
             for key in FIELDS:
+                if key in not_comparable:
+                    continue
                 left, right = getattr(previous, key), getattr(current, key)
                 if left != right:
                     changes[key] = {"before": left, "after": right}
@@ -30,6 +34,7 @@ class Difference:
             "identity_id": self.identity,
             "change": "added" if previous is None else "removed" if current is None else "updated",
             "fields": changes,
+            "not_comparable_fields": not_comparable,
             "before": self.before.public() if self.before else None,
             "after": self.after.public() if self.after else None,
         }
@@ -44,10 +49,15 @@ def material_changes(before: list[Group], after: list[Group]) -> list[dict]:
         if previous is not None and current is not None:
             left = previous.winner
             right = current.winner
-            no_content_change = all(getattr(left, field) == getattr(right, field) for field in FIELDS)
-            if (no_content_change and previous.disputed_fields() == current.disputed_fields()
-                    and {(item.source, item.item_id) for item in previous.rows}
-                    == {(item.source, item.item_id) for item in current.rows}):
+            not_comparable = set(previous.not_comparable()) | set(current.not_comparable())
+            no_content_change = all(
+                getattr(left, field) == getattr(right, field)
+                for field in FIELDS if field not in not_comparable)
+            same_basis = left.template == right.template
+            if (no_content_change and same_basis
+                    and previous.disputed_fields() == current.disputed_fields()
+                    and {(item.source, item.item_id, item.template) for item in previous.rows}
+                    == {(item.source, item.item_id, item.template) for item in current.rows}):
                 continue
         output.append(Difference(key, previous, current).payload())
     return output

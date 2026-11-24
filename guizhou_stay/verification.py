@@ -14,13 +14,14 @@ def issue(code: str, **details) -> dict:
 
 def verified_pages(db, session_id: str):
     return db.execute(
-        """SELECT p.page_no,p.payload,p.page_digest,c.raw_html,c.html_digest,c.locator
+        """SELECT p.page_no,p.payload,p.page_digest,p.template,
+                  c.raw_html,c.html_digest,c.locator
            FROM pages AS p LEFT JOIN captures AS c USING(session_id,page_no)
            WHERE p.session_id=? ORDER BY p.page_no""", (session_id,),
     ).fetchall()
 
 
-def replay_page(session_id: str, row) -> dict:
+def replay_page(session_id: str, row, *, pinned_template: str | None = None) -> dict:
     page_no = row["page_no"]
     issues = []
     document = json.loads(row["payload"])
@@ -36,13 +37,21 @@ def replay_page(session_id: str, row) -> dict:
             issues.append(issue("html_replay", page=page_no, reason=exc.code))
         else:
             parsed_document = parsed.model_dump(mode="json")
+            # 当时采到的模板标识已冻结；当前解析器升级不能改写旧页的含义。
+            pinned = pinned_template or document.get("template")
+            if pinned and parsed_document.get("template") != pinned:
+                issues.append(issue("template_drift", page=page_no,
+                                    frozen=pinned, current=parsed_document.get("template")))
+            else:
+                parsed_document = {**parsed_document, "template": document.get("template")}
             if parsed_document != document:
                 different = sorted(key for key in parsed_document
                                    if parsed_document[key] != document.get(key))
                 issues.append(issue("extraction_drift", page=page_no, fields=different))
     return {
         "page": page_no, "items": len(document["rows"]), "has_raw": has_raw,
-        "page_digest": row["page_digest"], "issues": issues, "document": document,
+        "template": document.get("template"), "page_digest": row["page_digest"],
+        "issues": issues, "document": document,
     }
 
 
@@ -66,6 +75,10 @@ def audit_continuation(pages: list[dict], session) -> list[dict]:
             findings.append(issue("capture_revision", page=number))
         if document["locale"] != session["locale"]:
             findings.append(issue("capture_locale", page=number))
+        if document.get("template") != session["template"]:
+            findings.append(issue("capture_template", page=number,
+                                  expected=session["template"],
+                                  observed=document.get("template")))
         captured = document["captured_at"]
         if captured < last_capture:
             findings.append(issue("capture_time", page=number))
@@ -82,11 +95,11 @@ def audit_continuation(pages: list[dict], session) -> list[dict]:
 
 def observation_groups(db, session_id: str) -> dict:
     rows = db.execute(
-        """SELECT o.item_id,o.page_no,s.digest FROM observations AS o
-           JOIN supplies AS s USING(item_id,source,source_revision)
+        """SELECT o.item_id,o.page_no,o.template,s.digest FROM observations AS o
+           JOIN supplies AS s USING(item_id,source,source_revision,template)
            WHERE o.session_id=? ORDER BY o.page_no,o.item_id""", (session_id,)
     )
-    return {(row["page_no"], row["item_id"]): row["digest"] for row in rows}
+    return {(row["page_no"], row["item_id"], row["template"]): row["digest"] for row in rows}
 
 
 def expected_observations(pages: list[dict]) -> dict:
@@ -96,8 +109,9 @@ def expected_observations(pages: list[dict]) -> dict:
     result = {}
     for row in pages:
         page = Page.model_validate(row["document"])
+        template = row.get("template") or page.template
         for item, fingerprint in gather_rows(page):
-            result[row["page"], item.item_id] = fingerprint
+            result[row["page"], item.item_id, template] = fingerprint
     return result
 
 
@@ -111,16 +125,54 @@ def audit_observations(db, session, pages):
     findings = []
     for key in sorted(expected.keys() | observed.keys()):
         if expected.get(key) != observed.get(key):
-            page, item_id = key
-            findings.append(issue("observation_differs", page=page, item_id=item_id))
+            page, item_id, template = key
+            findings.append(issue("observation_differs", page=page, item_id=item_id,
+                                  template=template))
     return findings
+
+
+def interpretation_summary(db, session_id: str) -> dict:
+    """复核时给出每条数据当时采用的页面模板与字段口径。
+
+    会话中止时，已收到的页面仍逐条列出；它们仍是可证明的旧版供给事实。
+    """
+    from guizhou_stay.contracts import Supply
+
+    session = db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+    rows = db.execute(
+        """SELECT p.page_no,p.template AS page_template,p.payload
+           FROM pages AS p WHERE p.session_id=? ORDER BY p.page_no""", (session_id,))
+    result = []
+    seen = set()
+    for row in rows:
+        for raw in json.loads(row["payload"])["rows"]:
+            item = Supply.model_validate({**raw, "source": session["source"],
+                                          "source_revision": session["source_revision"]})
+            key = (row["page_no"], item.item_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append({
+                "item_id": item.item_id, "page_no": row["page_no"],
+                "template": row["page_template"] or item.template,
+                "window_code": item.window_code,
+                "field_basis": item.field_basis,
+                "not_comparable_fields": item.not_comparable_fields,
+                "promoted": db.execute(
+                    """SELECT 1 FROM observations WHERE item_id=? AND source=?
+                       AND source_revision=? AND session_id=? AND page_no=?""",
+                    (item.item_id, item.source, item.source_revision, session_id,
+                     row["page_no"])).fetchone() is not None,
+            })
+    return {"items": result}
 
 
 def review(db, session_id: str) -> dict:
     session = db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
     if session is None:
         raise missing("session", session_id)
-    pages = [replay_page(session_id, row) for row in verified_pages(db, session_id)]
+    pages = [replay_page(session_id, row, pinned_template=row["template"])
+             for row in verified_pages(db, session_id)]
     findings = [problem for page in pages for problem in page["issues"]]
     findings.extend(audit_continuation(pages, session))
     if not findings:
@@ -130,6 +182,9 @@ def review(db, session_id: str) -> dict:
             findings.append(issue("invalid_observation", reason=exc.code))
     return {
         "session_id": session_id, "state": session["state"], "valid": not findings,
+        "template": session["template"],
+        "template_transition": bool(session["template_transition"]),
         "pages": [{k: v for k, v in page.items() if k != "document"} for page in pages],
+        "interpretations": interpretation_summary(db, session_id)["items"],
         "findings": findings,
     }

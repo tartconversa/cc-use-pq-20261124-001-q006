@@ -13,8 +13,10 @@ class CatalogTest(ApiCase):
 
     def test_same_provider_title_revision_updates_identity_aliases(self):
         self.open(pages=1)
-        self.send_page(page(1, [item("stay-1", "云上小院")], total=1, has_next=False))
-        self.assertEqual(self.send_page(page(1, [item("stay-1", "云上小院")], total=1, has_next=False))["replayed"], True)
+        # 重放必须是同一份页面内容；复用同一对象避免秒级时间戳造成偶发差异。
+        data = page(1, [item("stay-1", "云上小院")], total=1, has_next=False)
+        self.send_page(data)
+        self.assertEqual(self.send_page(data)["replayed"], True)
         identities = self.call("GET", "/identities")["items"]
         self.assertEqual(identities[0]["aliases"], ["stay-1"])
 

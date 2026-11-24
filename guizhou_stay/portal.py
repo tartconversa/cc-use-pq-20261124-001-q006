@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import re
 from typing import Protocol
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 from pydantic import ValidationError
 
+from guizhou_stay import templates
 from guizhou_stay.contracts import Page, SessionOpen, Supply
 from guizhou_stay.digest import digest_text
 from guizhou_stay.errors import DomainError, invalid
@@ -138,7 +140,18 @@ def require_metadata(values: dict) -> dict:
                              retryable=False) from exc
 
 
-def normalize_cards(cards: list[dict], meta: dict) -> list[dict]:
+def resolve_template(values: dict) -> str:
+    """来源声明的模板版本标识；未声明时兼容为旧版静态目录。"""
+    declared = (values.get("template") or "").strip()
+    if not declared:
+        return templates.DEFAULT_TEMPLATE
+    if not templates.known(declared):
+        raise CaptureFailure("portal_template", "来源声明了未登记的模板版本",
+                             retryable=False, details={"template": declared})
+    return declared
+
+
+def normalize_cards(cards: list[dict], meta: dict, template: str) -> list[dict]:
     rows = []
     for card in cards:
         try:
@@ -157,6 +170,15 @@ def normalize_cards(cards: list[dict], meta: dict) -> list[dict]:
                 "address_hint": card["address_hint"],
                 "price_band": card["price_band"],
                 "service_window": card["service_window"],
+                "template": card.get("template") or template,
+                "window_code": card["window_code"],
+                "field_basis": {key: templates.caliber(card.get("template") or template, key)
+                                for key in templates.VALUE_FIELDS},
+                "alternate_interpretations": card.get("alternate_interpretations") or [],
+                "not_comparable_fields": card.get("not_comparable_fields") or [],
+                "conflicts": card.get("conflicts") or {},
+                "compat_view": card.get("compat_view"),
+                "ingest_source": "capture",
             })
         except ValidationError as exc:
             raise CaptureFailure(
@@ -169,17 +191,28 @@ def normalize_cards(cards: list[dict], meta: dict) -> list[dict]:
 
 
 def convert(session_id: str, html: str, url: str) -> Capture:
-    extracted = extract_page(html, url)
+    try:
+        extracted = extract_page(html, url)
+    except DomainError as exc:
+        if isinstance(exc, CaptureFailure):
+            raise
+        raise CaptureFailure(exc.code, exc.message, retryable=False,
+                             details=exc.details) from exc
     meta = require_metadata(extracted["metadata"]["capture"])
+    declared = extracted["template"]
+    if not templates.known(declared):
+        raise CaptureFailure("portal_template", "来源声明了未登记的模板版本",
+                             retryable=False, details={"template": declared})
     if extracted["stats"]["invalid"]:
         raise CaptureFailure("portal_card", "存在无法识别的可见卡片",
                              retryable=False, details={"positions": extracted["stats"]["invalid"]})
     if not extracted["cards"] and extracted["metadata"]["capture"].get("empty") != "confirmed":
         raise CaptureFailure("unconfirmed_empty", "未确认空结果，不能认定页面无供给",
                              retryable=True)
-    rows = normalize_cards(extracted["cards"], meta)
+    rows = normalize_cards(extracted["cards"], meta, declared)
     try:
-        page = Page(session_id=session_id, rows=rows, has_next=bool(meta["next_token"]), **meta)
+        page = Page(session_id=session_id, rows=rows, has_next=bool(meta["next_token"]),
+                    template=declared, **meta)
     except ValidationError as exc:
         raise CaptureFailure("portal_page", "页面元数据不符合会话合同",
                              retryable=False) from exc
@@ -192,4 +225,4 @@ def session_from_first(session_id: str, capture: Capture) -> SessionOpen:
         raise CaptureFailure("portal_first", "首次读取未返回首屏", retryable=False)
     return SessionOpen(session_id=session_id, source=page.source, query=page.query,
                        source_revision=page.source_revision, expected_pages=page.total_pages,
-                       locale=page.locale)
+                       locale=page.locale, template=page.template)

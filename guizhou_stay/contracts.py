@@ -6,10 +6,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
+from guizhou_stay import templates
+
 Key = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,47}$")]
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=240)]
 Category = Literal["residence", "route", "medical", "food", "insurance", "language", "transport", "culture"]
 Status = Literal["active", "withdrawn", "pending"]
+WindowCode = Literal["absent", "all-day", "night-duty", "pending", "unspecified-bookable"]
+Template = Annotated[str, StringConstraints(pattern=r"^directory-v[0-9]{1,3}$")]
 
 
 class StrictModel(BaseModel):
@@ -39,6 +43,8 @@ class Page(StrictModel):
     next_token: Key | None = None
     request_token: Key | None = None
     locale: Text = "zh-HK"
+    template: Template = templates.DEFAULT_TEMPLATE
+    template_transition: bool = False
 
     @model_validator(mode="after")
     def page_bounds(self):
@@ -50,6 +56,13 @@ class Page(StrictModel):
             raise ValueError("末页不能携带下一页游标")
         return self
 
+    @field_validator("template")
+    @classmethod
+    def registered_template(cls, value: str) -> str:
+        if not templates.known(value):
+            raise ValueError("模板版本未登记")
+        return value
+
 
 class SessionOpen(StrictModel):
     session_id: Key
@@ -58,6 +71,7 @@ class SessionOpen(StrictModel):
     source_revision: Annotated[int, Field(ge=1, le=1_000_000)]
     expected_pages: Annotated[int, Field(ge=1, le=10_000)]
     locale: Text = "zh-HK"
+    template: Template = templates.DEFAULT_TEMPLATE
 
 
 class Supply(StrictModel):
@@ -76,6 +90,15 @@ class Supply(StrictModel):
     price_band: Text | None = None
     service_window: Text | None = None
     tags: list[Text] = Field(default_factory=list, max_length=20)
+    # 解释依据随供给一起冻结：模板、时段口径、字段口径与兼容视图。
+    template: Template = templates.DEFAULT_TEMPLATE
+    window_code: WindowCode = "absent"
+    field_basis: dict[str, str] = Field(default_factory=dict)
+    alternate_interpretations: list[dict] = Field(default_factory=list)
+    not_comparable_fields: list[Text] = Field(default_factory=list)
+    conflicts: dict = Field(default_factory=dict)
+    compat_view: dict | None = None
+    ingest_source: Literal["capture", "manual"] = "manual"
 
     @field_validator("updated_at")
     @classmethod
@@ -83,6 +106,32 @@ class Supply(StrictModel):
         if value > datetime.now(timezone.utc):
             raise ValueError("供给更新时间不能在未来")
         return value
+
+    @field_validator("template")
+    @classmethod
+    def registered_template(cls, value: str) -> str:
+        if not templates.known(value):
+            raise ValueError("模板版本未登记")
+        return value
+
+    @model_validator(mode="after")
+    def frozen_basis(self):
+        if not self.field_basis:
+            self.field_basis = {key: templates.caliber(self.template, key)
+                                for key in templates.VALUE_FIELDS}
+        return self
+
+
+class Interpretation(StrictModel):
+    """一次签发所采用的页面模板与字段口径。"""
+    template: Template
+    window_code: WindowCode
+    fields: dict[str, str]
+
+    @classmethod
+    def of(cls, item: Supply) -> "Interpretation":
+        return cls(template=item.template, window_code=item.window_code, fields=item.field_basis)
+
 
 
 class Evidence(StrictModel):
@@ -96,6 +145,7 @@ class Evidence(StrictModel):
     source_revision: Annotated[int, Field(ge=1, le=1_000_000)]
     document_ref: Text
     status: Literal["verified", "pending", "rejected"]
+    template: Template = templates.DEFAULT_TEMPLATE
 
     @model_validator(mode="after")
     def evidence_period(self):

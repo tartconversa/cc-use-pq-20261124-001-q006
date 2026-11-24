@@ -149,7 +149,8 @@ def commit_page(db, capture: Capture, *, at: datetime, claim: Claim | None = Non
     if receipt.get("stale"):
         db.execute("UPDATE collections SET generation=NULL,lease_expires=NULL WHERE session_id=?",
                    (page.session_id,))
-        record_event(db, page.session_id, page.page_no, "scope_changed", receipt["stale"], at=at)
+        code = "template_changed" if receipt.get("template_transition") else "scope_changed"
+        record_event(db, page.session_id, page.page_no, code, receipt["stale"], at=at)
         return progress(db, page.session_id)
     db.execute(
         """INSERT INTO captures(session_id,page_no,locator,raw_html,html_digest)
@@ -225,6 +226,7 @@ def progress(db, session_id):
         next_token=lease["cursor"] if report["state"] == "open" else None,
         attempts=lease["attempts"],
         retry_at=lease["retry_at"],
+        template=report.get("template"),
         events=[{**dict(row), "detail": json.loads(row["detail"])} for row in reversed(records)],
     )
     return report

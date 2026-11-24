@@ -12,6 +12,8 @@ EXPLANATIONS = {
     "stale_source": "重新采集供给状态及来源修订",
     "unobserved_at": "核对实际观察日期",
     "future_supply": "检查页面的更新时间与观察时间",
+    "template_changed": "按共同业务口径恢复或重采受影响的页面",
+    "no_common_basis": "先形成共同依据或按新口径重采，不能拼接两版页面",
 }
 
 

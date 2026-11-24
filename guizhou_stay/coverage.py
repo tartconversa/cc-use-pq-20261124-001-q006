@@ -6,7 +6,7 @@ from sqlite3 import Connection
 
 from guizhou_stay import plans
 from guizhou_stay.catalog import Group, groups, receipt_sources
-from guizhou_stay.contracts import CoveragePolicy, PublishRequest
+from guizhou_stay.contracts import CoveragePolicy, Interpretation, PublishRequest
 from guizhou_stay.digest import digest
 from guizhou_stay.errors import conflict, invalid, missing
 from guizhou_stay.provenance import active_for
@@ -37,9 +37,11 @@ def inspect_group(db: Connection, group: Group, policy: CoveragePolicy, at: date
             rejections.append("stale_source")
             continue
         proofs = active_for(db, version.item_id, version.category, at,
-                            source=version.source, revision=version.source_revision)
+                            source=version.source, revision=version.source_revision,
+                            template=version.template)
         witnesses.append({
             "item": version.model_dump(mode="json"),
+            "interpretation": Interpretation.of(version).model_dump(mode="json"),
             "proofs": [proof.model_dump(mode="json") for proof in proofs],
             "captures": [source for source in sources
                          if datetime.fromisoformat(source["captured_at"]) <= at],
@@ -56,7 +58,9 @@ def inspect_group(db: Connection, group: Group, policy: CoveragePolicy, at: date
         state = "unverified"
     return {
         "identity_id": group.identity_id, "item_id": item.item_id, "category": item.category,
-        "state": state, "disputed_fields": gaps, "reasons": sorted(set(rejections)),
+        "state": state, "disputed_fields": gaps,
+        "not_comparable_fields": group.not_comparable(),
+        "reasons": sorted(set(rejections)),
         "witnesses": witnesses,
     }
 
@@ -126,6 +130,28 @@ def latest_revision(db: Connection, package_id: str) -> int:
                       (package_id,)).fetchone()[0]
 
 
+def interpretations_of(assessment: dict) -> list[dict]:
+    """签发时每条数据所采用的页面模板与字段口径。"""
+    index = {}
+    for result in assessment["categories"].values():
+        for finding in result["findings"]:
+            for witness in finding["witnesses"]:
+                value = witness.get("interpretation") or {}
+                key = (finding["category"], finding["identity_id"], witness["item"]["item_id"],
+                       witness["item"].get("template"), value.get("window_code"))
+                index[key] = {
+                    "category": finding["category"],
+                    "identity_id": finding["identity_id"],
+                    "item_id": witness["item"]["item_id"],
+                    "template": witness["item"].get("template"),
+                    "window_code": value.get("window_code"),
+                    "session_ids": sorted({capture["session_id"] for capture in witness["captures"]}),
+                    "not_comparable_fields": finding.get("not_comparable_fields", []),
+                }
+    return [index[key] for key in sorted(index, key=lambda value: tuple(
+        "" if part is None else str(part) for part in value))]
+
+
 def create_package(db: Connection, request: PublishRequest) -> dict:
     request_digest = digest(request.model_dump(mode="json"))
     existing = db.execute("SELECT document FROM packages WHERE package_id=? AND request_digest=?",
@@ -136,24 +162,31 @@ def create_package(db: Connection, request: PublishRequest) -> dict:
     if request.expected_package_revision is not None and previous != request.expected_package_revision:
         raise conflict("package_revision", "供给包已有更新，请重新预览",
                        {"current_revision": previous})
-    assessment = assess(db, request.region, request.policy, request.requested_at, request.expected_revision, request.plan_id)
+    assessment = assess(db, request.region, request.policy, request.requested_at,
+                        request.expected_revision, request.plan_id)
     if request.preview_digest is not None and request.preview_digest != digest(assessment):
         raise conflict("preview_changed", "采集或证明在预览后发生变化，请重新核对")
     state = "published" if assessment["ready"] else "draft"
+    interpretations = interpretations_of(assessment)
     document = {
         "package_id": request.package_id, "revision": previous + 1,
         "region": request.region, "requested_at": assessment["as_of"],
         "source_revision": request.expected_revision, "policy": request.policy.model_dump(mode="json"),
         "state": state, "items": assessment["categories"], "gaps": assessment["gaps"],
         "assessment": assessment,
+        "interpretations": interpretations,
+        "template_basis": sorted({value["template"] for value in interpretations
+                                  if value["template"]}),
     }
     document["digest"] = digest(document)
     db.execute(
         """INSERT INTO packages(package_id,revision,region,policy,items,gaps,digest,state,
-           created_at,request_digest,document) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+           created_at,request_digest,document,source_revision,interpretations)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (request.package_id, previous + 1, request.region, dump(document["policy"]),
          dump(document["items"]), dump(document["gaps"]), document["digest"], state,
-         document["requested_at"], request_digest, dump(document)),
+         document["requested_at"], request_digest, dump(document),
+         request.expected_revision, dump(interpretations)),
     )
     return document
 

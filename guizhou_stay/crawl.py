@@ -18,15 +18,15 @@ def open_session(db: Connection, body: SessionOpen) -> dict:
     stamp = now()
     row = db.execute("SELECT * FROM sessions WHERE session_id=?", (body.session_id,)).fetchone()
     if row:
-        fields = ("source", "query", "source_revision", "expected_pages", "locale")
+        fields = ("source", "query", "source_revision", "expected_pages", "locale", "template")
         if any(row[key] != getattr(body, key) for key in fields):
             raise conflict("session_changed", "采集会话编号已对应另一份查询")
         return dict(row)
     db.execute(
         """INSERT INTO sessions(session_id,source,query,source_revision,expected_pages,
-           locale,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+           locale,state,created_at,updated_at,template) VALUES(?,?,?,?,?,?,?,?,?,?)""",
         (body.session_id, body.source, body.query, body.source_revision,
-         body.expected_pages, body.locale, "open", stamp, stamp),
+         body.expected_pages, body.locale, "open", stamp, stamp, body.template),
     )
     return dict(session(db, body.session_id))
 
@@ -50,6 +50,25 @@ def scope_delta(current, body: Page) -> dict:
         field: {"expected": current[field], "observed": value}
         for field, value in fields.items()
         if current[field] != value
+    }
+
+
+def template_delta(db: Connection, current, body: Page) -> dict:
+    """会话中途来源模板版本改变：可恢复，但绝不算作同一批次。"""
+    if body.template == current["template"]:
+        return {}
+    pages = [
+        {"page_no": row["page_no"], "template": row["template"],
+         "source_revision": row["source_revision"]}
+        for row in db.execute(
+            "SELECT page_no,template,source_revision FROM pages WHERE session_id=? ORDER BY page_no",
+            (body.session_id,))
+    ]
+    return {
+        "expected": current["template"],
+        "observed": body.template,
+        "observed_page": body.page_no,
+        "received_pages": pages,
     }
 
 
@@ -87,6 +106,16 @@ def save_page(db: Connection, body: Page) -> dict:
         db.execute("UPDATE sessions SET state='stale', updated_at=?, reason=? WHERE session_id=?",
                    (now(), dump(delta), body.session_id))
         return {"stale": delta}
+    change = template_delta(db, current, body) if current["state"] == "open" else {}
+    if change:
+        reason = dump({"template_transition": change})
+        db.execute(
+            """UPDATE sessions SET state='stale', template_transition=1,
+               updated_at=?, reason=? WHERE session_id=?""",
+            (now(), reason, body.session_id),
+        )
+        return {"stale": change, "template_conflict": change, "state": "stale",
+                "template_transition": True}
     old = db.execute(
         "SELECT page_digest FROM pages WHERE session_id=? AND page_no=?",
         (body.session_id, body.page_no),
@@ -100,16 +129,17 @@ def save_page(db: Connection, body: Page) -> dict:
         raise conflict("session_closed", "采集会话已结束，不能追加页面")
     validate_continuation(db, body)
     db.execute(
-        "INSERT INTO pages VALUES(?,?,?,?,?,?,?,?)",
-        (body.session_id, body.page_no, page_digest, body.source_revision, body.captured_at.isoformat(),
-         body.viewport, dump(payload), body.next_token),
+        "INSERT INTO pages VALUES(?,?,?,?,?,?,?,?,?)",
+        (body.session_id, body.page_no, page_digest, body.source_revision,
+         body.captured_at.isoformat(), body.viewport, dump(payload), body.next_token,
+         body.template),
     )
     complete = body.page_no == current["expected_pages"]
     state = "complete" if complete else "open"
     db.execute("UPDATE sessions SET state=?,updated_at=? WHERE session_id=?",
                (state, now(), body.session_id))
     return {"page_no": body.page_no, "replayed": False, "page_digest": page_digest,
-            "complete": complete}
+            "complete": complete, "template": body.template}
 
 
 def read_pages(db: Connection, session_id: str, *, revision: int | None = None) -> list[dict]:
@@ -123,13 +153,14 @@ def read_pages(db: Connection, session_id: str, *, revision: int | None = None) 
 def session_report(db: Connection, session_id: str) -> dict:
     row = session(db, session_id)
     pages = db.execute(
-        """SELECT page_no,page_digest,source_revision,captured_at,next_token FROM pages
+        """SELECT page_no,page_digest,source_revision,captured_at,next_token,template FROM pages
            WHERE session_id=? ORDER BY page_no""", (session_id,)
     ).fetchall()
     return {
         "session_id": row["session_id"], "source": row["source"], "query": row["query"],
         "source_revision": row["source_revision"], "state": row["state"], "reason": row["reason"],
         "locale": row["locale"], "expected_pages": row["expected_pages"],
+        "template": row["template"], "template_transition": bool(row["template_transition"]),
         "pages": [dict(page) for page in pages], "received_pages": len(pages),
         "complete": row["state"] == "complete",
     }

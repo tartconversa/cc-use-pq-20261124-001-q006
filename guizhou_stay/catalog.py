@@ -8,6 +8,7 @@ import unicodedata
 
 from pydantic import ValidationError
 
+from guizhou_stay import templates
 from guizhou_stay.contracts import Page, Supply
 from guizhou_stay.digest import digest
 from guizhou_stay.errors import conflict, invalid, missing
@@ -60,14 +61,15 @@ def ingest_page(db: Connection, body: Page) -> dict:
         if previous is not None and fingerprint != previous["digest"]:
             raise conflict("supply_changed", "跨页重复卡片的内容不一致",
                            {"item_id": item.item_id, "previous_page": previous["page_no"]})
-        db.execute("INSERT INTO staged VALUES(?,?,?,?,?)",
+        db.execute("INSERT INTO staged VALUES(?,?,?,?,?,?)",
                    (body.session_id, body.page_no, item.item_id, fingerprint,
-                    dump(item.model_dump(mode="json"))))
+                    dump(item.model_dump(mode="json")), item.template))
     if body.has_next:
         return {"accepted": len(rows), "repeated": 0, "visible": False,
-                "source_revision": body.source_revision}
+                "source_revision": body.source_revision, "template": body.template}
     result = promote(db, body.session_id)
-    return {**result, "visible": True, "source_revision": body.source_revision}
+    return {**result, "visible": True, "source_revision": body.source_revision,
+            "template": body.template}
 
 
 def promote(db: Connection, session_id: str) -> dict:
@@ -84,23 +86,59 @@ def promote(db: Connection, session_id: str) -> dict:
             accepted += 1
         else:
             repeated += 1
-        db.execute("INSERT INTO observations VALUES(?,?,?,?,?)",
-                   (item.item_id, item.source, item.source_revision, session_id, row["page_no"]))
-    return {"accepted": accepted, "repeated": repeated}
+        db.execute("INSERT OR IGNORE INTO observations VALUES(?,?,?,?,?,?)",
+                   (item.item_id, item.source, item.source_revision, session_id,
+                    row["page_no"], item.template))
+    result = {"accepted": accepted, "repeated": repeated}
+    result.update(index_interpretations(db, session_id))
+    return result
+
+
+def index_interpretations(db: Connection, session_id: str) -> dict:
+    """为一次会话实际落地的每条供给冻结模板与字段口径。"""
+    rows = db.execute(
+        """SELECT s.item_id,s.source,s.source_revision,s.payload,
+                  o.page_no,p.template AS page_template
+           FROM observations AS o
+           JOIN supplies AS s USING(item_id,source,source_revision,template)
+           LEFT JOIN pages AS p USING(session_id,page_no)
+           WHERE o.session_id=?""", (session_id,)
+    ).fetchall()
+    if not rows:
+        return {"interpretations": {}, "field_basis": {}}
+    interpretations = {}
+    basis = {}
+    for row in rows:
+        item = Supply.model_validate_json(row["payload"])
+        template = row["page_template"] or item.template
+        key = f"{item.source}/{item.item_id}/{item.source_revision}"
+        entry = {"template": template, "window_code": item.window_code,
+                 "session_id": session_id, "page_no": row["page_no"],
+                 "alternate_interpretations": item.alternate_interpretations,
+                 "not_comparable_fields": item.not_comparable_fields}
+        existing = interpretations.get(key)
+        if existing is not None and existing != entry:
+            raise conflict("interpretation_changed", "同一供给在同一会话得到两种模板口径",
+                           {"item_id": item.item_id})
+        interpretations[key] = entry
+        basis[key] = item.field_basis
+    return {"interpretations": interpretations, "field_basis": basis}
 
 
 def record_supply(db, item: Supply, fingerprint: str, payload: str) -> bool:
     old = db.execute(
-        """SELECT digest FROM supplies WHERE item_id=? AND source=? AND source_revision=?""",
-        (item.item_id, item.source, item.source_revision),
+        """SELECT digest FROM supplies
+           WHERE item_id=? AND source=? AND source_revision=? AND template=?""",
+        (item.item_id, item.source, item.source_revision, item.template),
     ).fetchone()
     if old is not None:
         if old["digest"] != fingerprint:
-            raise conflict("supply_changed", "另一完整采集已登记不同的同号同修订卡片",
+            raise conflict("supply_changed", "另一完整采集已登记不同的同号同修订同模板卡片",
                            {"item_id": item.item_id, "source": item.source})
         return False
-    db.execute("INSERT INTO supplies VALUES(?,?,?,?,?,?)",
-               (item.item_id, item.source, item.source_revision, fingerprint, payload, stamp()))
+    db.execute("INSERT INTO supplies VALUES(?,?,?,?,?,?,?)",
+               (item.item_id, item.source, item.source_revision, fingerprint, payload,
+                stamp(), item.template))
     _attach_identity(db, item, fingerprint)
     return True
 
@@ -111,34 +149,56 @@ def _attach_identity(db: Connection, item: Supply, item_digest: str) -> str:
         """INSERT INTO identities VALUES(?,?,?,?,?,?,?) ON CONFLICT(identity_id) DO NOTHING""",
         (identity, item.kind, canonical_key(item), "[]", item_digest, item.status, stamp()),
     )
-    db.execute("INSERT INTO identity_sources VALUES(?,?,?,?,?)",
-               (identity, item.item_id, item.source, item.source_revision, item_digest))
+    db.execute(
+        "INSERT OR IGNORE INTO identity_sources VALUES(?,?,?,?,?,?)",
+        (identity, item.item_id, item.source, item.source_revision, item_digest,
+         item.template))
     return identity
 
 
-def supply(db: Connection, item_id: str, source: str, revision: int) -> Supply:
-    row = db.execute(
-        "SELECT payload FROM supplies WHERE item_id=? AND source=? AND source_revision=?",
-        (item_id, source, revision),
-    ).fetchone()
+def supply(db: Connection, item_id: str, source: str, revision: int,
+           *, template: str | None = None) -> Supply:
+    if template is None:
+        row = db.execute(
+            """SELECT payload FROM supplies WHERE item_id=? AND source=? AND source_revision=?
+               ORDER BY template DESC LIMIT 1""",
+            (item_id, source, revision),
+        ).fetchone()
+    else:
+        row = db.execute(
+            """SELECT payload FROM supplies
+               WHERE item_id=? AND source=? AND source_revision=? AND template=?""",
+            (item_id, source, revision, template),
+        ).fetchone()
     if row is None:
         raise missing("supply", f"{source}/{item_id}/{revision}")
     return Supply.model_validate_json(row["payload"])
 
 
-def versions(db: Connection, *, revision: int | None = None) -> list[Supply]:
+def versions(db: Connection, *, revision: int | None = None,
+             template: str | None = None) -> list[Supply]:
+    clauses = []
+    args: list = []
     if revision is not None:
-        rows = db.execute("SELECT payload FROM supplies WHERE source_revision=? ORDER BY source,item_id",
-                          (revision,))
+        clauses.append("source_revision=?")
+        args.append(revision)
+    if template is not None:
+        clauses.append("template=?")
+        args.append(template)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    if revision is not None:
+        rows = db.execute(
+            f"SELECT payload FROM supplies {where} ORDER BY source,item_id,template", args)
     else:
         rows = db.execute(
-            """WITH latest AS (
-               SELECT source,item_id,MAX(source_revision) AS source_revision FROM supplies
-               GROUP BY source,item_id
-               )
-               SELECT supplies.payload FROM supplies JOIN latest USING(source,item_id,source_revision)
-               ORDER BY source,item_id"""
-        )
+            f"""WITH latest AS (
+                 SELECT source,item_id,template,MAX(source_revision) AS source_revision
+                 FROM supplies GROUP BY source,item_id,template
+                 )
+                 SELECT supplies.payload FROM supplies JOIN latest
+                 USING(source,item_id,source_revision,template)
+                 {where}
+                 ORDER BY supplies.source,supplies.item_id,supplies.template""", args)
     return [Supply.model_validate_json(row["payload"]) for row in rows]
 
 
@@ -150,11 +210,39 @@ class Group:
     @property
     def winner(self) -> Supply:
         return min(self.rows, key=lambda item: (-item.updated_at.timestamp(),
+                                                -templates.version(item.template),
                                                 item.source, item.item_id))
 
     def disputed_fields(self) -> list[str]:
-        fields = ("category", "status", "address_hint", "price_band", "service_window")
-        return [key for key in fields if len({getattr(item, key) for item in self.rows}) > 1]
+        calibers = {templates.caliber(item.template, "service_window") for item in self.rows}
+        declared = set()
+        for item in self.rows:
+            declared.update(item.conflicts)
+        ordered = []
+        for field_name in ("category", "status", "address_hint", "price_band",
+                           "service_window"):
+            if field_name == "service_window" and len(calibers) > 1:
+                continue
+            if field_name in declared or len({getattr(item, field_name)
+                                              for item in self.rows}) > 1:
+                ordered.append(field_name)
+        return ordered
+
+    def not_comparable(self) -> list[str]:
+        fields = set()
+        for item in self.rows:
+            fields.update(item.not_comparable_fields)
+        if len({templates.caliber(item.template, "service_window") for item in self.rows}) > 1:
+            fields.add("service_window")
+        return sorted(fields)
+
+    def conflicts(self) -> dict:
+        """页内新版卡与兼容区卡片的字段冲突，双方取值都保留。"""
+        merged = {}
+        for item in self.rows:
+            for field_name, value in item.conflicts.items():
+                merged.setdefault(field_name, []).append({"item_id": item.item_id, **value})
+        return merged
 
     def public(self) -> dict:
         return {
@@ -165,16 +253,24 @@ class Group:
             "status": self.winner.status,
             "current_digest": digest(self.winner.model_dump(mode="json")),
             "disputed_fields": self.disputed_fields(),
+            "not_comparable_fields": self.not_comparable(),
+            "conflicts": self.conflicts(),
+            "interpretations": templates.interpretations([
+                {"template": item.template, "window_code": item.window_code}
+                for item in self.rows
+            ]),
             "sources": [
-                {"source": item.source, "item_id": item.item_id, "revision": item.source_revision}
+                {"source": item.source, "item_id": item.item_id, "revision": item.source_revision,
+                 "template": item.template, "window_code": item.window_code}
                 for item in self.rows
             ],
         }
 
 
-def groups(db: Connection, *, region: str | None = None, revision: int | None = None) -> list[Group]:
+def groups(db: Connection, *, region: str | None = None, revision: int | None = None,
+           template: str | None = None) -> list[Group]:
     index = {}
-    for item in versions(db, revision=revision):
+    for item in versions(db, revision=revision, template=template):
         if region is None or item.region == region:
             index.setdefault(identity_id(item), []).append(item)
     return [Group(key, values) for key, values in sorted(index.items())]
@@ -186,17 +282,20 @@ def identities(db: Connection, *, kind: str | None = None, region: str | None = 
 
 
 def current_supplies(db: Connection, *, region: str | None = None,
-                     source_revision: int | None = None) -> list[Supply]:
-    return [group.winner for group in groups(db, region=region, revision=source_revision)]
+                     source_revision: int | None = None,
+                     template: str | None = None) -> list[Supply]:
+    return [group.winner for group in groups(db, region=region, revision=source_revision,
+                                             template=template)]
 
 
 def receipt_sources(db: Connection, item: Supply) -> list[dict]:
     rows = db.execute(
-        """SELECT o.session_id,o.page_no,p.page_digest,p.captured_at,c.html_digest,c.locator
+        """SELECT o.session_id,o.page_no,p.page_digest,p.captured_at,c.html_digest,c.locator,
+                  p.template,o.template AS observed_template
            FROM observations AS o JOIN pages AS p USING(session_id,page_no)
            LEFT JOIN captures AS c USING(session_id,page_no)
-           WHERE o.item_id=? AND o.source=? AND o.source_revision=?
+           WHERE o.item_id=? AND o.source=? AND o.source_revision=? AND o.template=?
            ORDER BY o.session_id,o.page_no""",
-        (item.item_id, item.source, item.source_revision),
+        (item.item_id, item.source, item.source_revision, item.template),
     )
     return [dict(row) for row in rows]
